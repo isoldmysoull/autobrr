@@ -44,6 +44,12 @@ func (e *RetriableError) Error() string {
 
 var _ error = (*RetriableError)(nil)
 
+const (
+	downloadTorrentAttempts     = uint(12)
+	downloadTorrentInitialDelay = 10 * time.Second
+	downloadTorrentMaxBackoff   = 3 * time.Minute
+)
+
 type DownloadService struct {
 	log  zerolog.Logger
 	repo domain.ReleaseRepo
@@ -168,9 +174,16 @@ func (s *DownloadService) downloadTorrentFile(ctx context.Context, indexer *doma
 
 	errFunc := retry.Do(
 		retryableRequest(httpClient, req, r, tmpFile),
-		retry.Attempts(3),
-		retry.MaxJitter(time.Second*1),
-		//retry.Delay(time.Second*3),
+		s.downloadTorrentRetryOptions()...,
+	)
+
+	return errFunc
+}
+
+func (s *DownloadService) downloadTorrentRetryOptions() []retry.Option {
+	return []retry.Option{
+		retry.Attempts(downloadTorrentAttempts),
+		retry.Delay(downloadTorrentInitialDelay),
 		retry.DelayType(func(n uint, err error, config *retry.Config) time.Duration {
 			s.log.Error().Err(err).Msg("http call encountered error")
 
@@ -179,13 +192,15 @@ func (s *DownloadService) downloadTorrentFile(ctx context.Context, indexer *doma
 				s.log.Debug().Msgf("http call rate-limited, retry after %v", retriable.RetryAfter)
 				return retriable.RetryAfter
 			}
-			return time.Second * 3
-			// apply a default exponential back off strategy
-			//return retry.BackOffDelay(n, err, config)
-		}),
-	)
 
-	return errFunc
+			delay := retry.BackOffDelay(n, err, config)
+			if delay > downloadTorrentMaxBackoff {
+				return downloadTorrentMaxBackoff
+			}
+
+			return delay
+		}),
+	}
 }
 
 func retryableRequest(httpClient *http.Client, req *http.Request, r *domain.Release, tmpFile *os.File) func() error {
@@ -213,7 +228,7 @@ func retryableRequest(httpClient *http.Client, req *http.Request, r *domain.Rele
 			// Continue processing the response
 			break
 
-		//case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		// case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 		//	// Handle redirect
 		//	return retry.Unrecoverable(errors.New("redirect encountered for torrent (%s) file (%s) - status code: %d - check indexer keys for %s", r.TorrentName, r.DownloadURL, resp.StatusCode, r.Indexer.Name))
 
@@ -360,7 +375,7 @@ func (s *DownloadService) ResolveMagnetURI(ctx context.Context, r *domain.Releas
 		return errors.Wrap(err, "could not build request to resolve magnet uri")
 	}
 
-	//req.Header.Set("Content-Type", "application/json")
+	// req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "autobrr")
 
 	res, err := httpClient.Do(req)
